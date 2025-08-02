@@ -1,0 +1,12 @@
+# Crontab entries for MIDI Recorder
+# Add these to the pi user's crontab with: crontab -e
+
+# Daily backup at 3 AM
+0 3 * * * /home/chris/midi_backup.sh >> /var/log/midi_recorder/cron.log 2>&1
+
+# Weekly log rotation (Sunday at 2 AM)
+0 2 * * 0 /usr/sbin/logrotate -f /etc/logrotate.d/midi_recorder >> /var/log/midi_recorder/cron.log 2>&1
+
+# Monthly cleanup of old recordings (1st of month at 4 AM)
+# Removes MIDI files older than 90 days
+0 4 1 * * find /home/chris/midi_recordings -name "*.mid" -mtime +90 -delete >> /var/log/midi_recorder/cron.log 2>&1

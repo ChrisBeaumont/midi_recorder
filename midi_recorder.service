@@ -1,0 +1,34 @@
+[Unit]
+Description=MIDI Recorder Service
+After=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=chris
+Group=chris
+WorkingDirectory=/home/chris
+ExecStart=/home/chris/midi_recorder_venv/bin/python3 /home/chris/midi_recorder.py
+Restart=always
+RestartSec=5
+
+# Resource limits for stability
+MemoryLimit=256M
+CPUQuota=80%
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+
+# Process priority
+Nice=10
+
+# Watchdog (restart if unresponsive)
+WatchdogSec=300
+NotifyAccess=all
+
+# Environment
+Environment="PYTHONUNBUFFERED=1"
+
+[Install]
+WantedBy=multi-user.target
