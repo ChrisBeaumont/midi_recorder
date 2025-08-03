@@ -24,6 +24,9 @@ SESSION_TIMEOUT = 5
 IDLE_CHECK_INTERVAL = 5  # Check less frequently when idle
 DEFAULT_TEMPO = 500000  # microseconds per beat (120 BPM)
 TICKS_PER_BEAT = 480
+LOW_BLACK_NOTE = 22   # A#0/Bb0
+HIGH_BLACK_NOTE = 106  # A#7/Bb7
+SHORTCUT_TIMEOUT = 1.0  # seconds between shortcut presses
 
 notifier = SystemdNotifier()
 notifier.notify("READY=1")
@@ -41,6 +44,8 @@ class MidiRecorder:
         self.running = True
         self.in_low_power = False
         self.message_queue = queue.Queue()
+        self.low_note_state = {'count': 0, 'buffer': [], 'last_time': 0}
+        self.high_note_state = {'count': 0, 'buffer': [], 'last_time': 0}
         
         # Setup logging
         self.setup_logging()
@@ -145,27 +150,36 @@ class MidiRecorder:
         self.in_low_power = False
         self.logger.info("Started new recording session")
         
-    def stop_recording(self):
+    def stop_recording(self, suffix="", skip_queue=False, skip_buffer=False):
         """Stop recording and save the file"""
         if not self.recording:
             return
-            
+
         self.recording = False
-        
-        # Process any remaining messages in queue
-        self.process_message_queue()
-        
-        # Save the file
+
+        if skip_queue:
+            with self.message_queue.mutex:
+                self.message_queue.queue.clear()
+        else:
+            self.process_message_queue()
+
+        if not skip_buffer:
+            self.flush_shortcut_buffers()
+        else:
+            self.low_note_state = {'count': 0, 'buffer': [], 'last_time': 0}
+            self.high_note_state = {'count': 0, 'buffer': [], 'last_time': 0}
+
         if self.current_file and len(self.current_track) > 1:  # More than just tempo
             file_path = self.create_session_path()
+            if suffix:
+                file_path = file_path.with_name(file_path.stem + suffix + file_path.suffix)
             self.current_file.save(file_path)
             self.logger.info(f"Saved recording to {file_path}")
-            
-            # Log session statistics
+
             duration = self.last_message_time - self.first_message_time if self.first_message_time else 0
             self.logger.info(f"Session duration: {duration:.1f} seconds, "
                            f"Messages: {len(self.current_track) - 1}")
-            
+
         self.current_file = None
         self.current_track = None
         
@@ -193,47 +207,86 @@ class MidiRecorder:
             except:
                 pass
                 
-    def process_midi_message(self, msg, msg_timestamp):
-        """Process incoming MIDI message with accurate timing"""
-        # Ignore certain message types for activity detection
-        if msg.type in ['clock', 'active_sensing']:
-            return
-            
-        # Update activity timestamp
-        self.last_activity = time.time()
-        
-        # Start recording if not already
-        if not self.recording:
-            self.start_recording()
-            self.first_message_time = msg_timestamp
-            
-        # Exit low power mode
-        if self.in_low_power:
-            self.exit_low_power_mode()
-            
-        # Add message to track with accurate timing
+    def write_message(self, msg, msg_timestamp):
+        """Write a MIDI message to the current track with timing"""
         if self.current_track is not None:
-            # Calculate delta time in seconds from last message
             if self.last_message_time is None:
                 delta_seconds = 0
             else:
                 delta_seconds = msg_timestamp - self.last_message_time
-                
-            # Convert to MIDI ticks
-            # ticks = seconds * (ticks_per_beat * beats_per_second)
-            # beats_per_second = 1000000 / tempo_microseconds
+
             beats_per_second = 1000000.0 / DEFAULT_TEMPO
             delta_ticks = int(delta_seconds * TICKS_PER_BEAT * beats_per_second)
-            
-            # Ensure non-negative delta time
             delta_ticks = max(0, delta_ticks)
-            
-            # Create a copy of the message with the calculated delta time
+
             msg_copy = msg.copy()
             msg_copy.time = delta_ticks
             self.current_track.append(msg_copy)
-            
             self.last_message_time = msg_timestamp
+
+    def flush_buffer(self, state):
+        for m, ts in state['buffer']:
+            self.write_message(m, ts)
+        state['buffer'].clear()
+        state['count'] = 0
+        state['last_time'] = 0
+
+    def flush_shortcut_buffers(self):
+        self.flush_buffer(self.low_note_state)
+        self.flush_buffer(self.high_note_state)
+
+    def handle_shortcuts(self, msg, msg_timestamp):
+        """Handle bookmark and session end shortcuts"""
+        if msg.type in ['note_on', 'note_off']:
+            for note, state, suffix in [
+                (LOW_BLACK_NOTE, self.low_note_state, ''),
+                (HIGH_BLACK_NOTE, self.high_note_state, '-bookmark')
+            ]:
+                if msg.note == note:
+                    if msg.type == 'note_on' and state['count'] > 0 and \
+                            msg_timestamp - state['last_time'] > SHORTCUT_TIMEOUT:
+                        self.flush_buffer(state)
+                    state['buffer'].append((msg, msg_timestamp))
+                    if msg.type == 'note_on':
+                        state['count'] += 1
+                        state['last_time'] = msg_timestamp
+                        if state['count'] >= 3:
+                            with self.message_queue.mutex:
+                                self.message_queue.queue.clear()
+                            self.stop_recording(suffix=suffix,
+                                                skip_queue=True,
+                                                skip_buffer=True)
+                            return True
+                    return True
+
+            if self.low_note_state['count'] > 0:
+                self.flush_buffer(self.low_note_state)
+            if self.high_note_state['count'] > 0:
+                self.flush_buffer(self.high_note_state)
+            return False
+
+        if self.low_note_state['count'] > 0:
+            self.flush_buffer(self.low_note_state)
+        if self.high_note_state['count'] > 0:
+            self.flush_buffer(self.high_note_state)
+        return False
+
+    def process_midi_message(self, msg, msg_timestamp):
+        """Process incoming MIDI message with accurate timing"""
+        if msg.type in ['clock', 'active_sensing']:
+            return
+
+        self.last_activity = time.time()
+
+        if not self.recording:
+            self.start_recording()
+            self.first_message_time = msg_timestamp
+
+        if self.in_low_power:
+            self.exit_low_power_mode()
+
+        if not self.handle_shortcuts(msg, msg_timestamp):
+            self.write_message(msg, msg_timestamp)
             
     def process_message_queue(self):
         """Process all messages in the queue"""
